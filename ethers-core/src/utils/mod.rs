@@ -10,6 +10,10 @@ mod geth;
 #[cfg(not(target_arch = "wasm32"))]
 pub use geth::{Geth, GethInstance};
 
+/// Utilities for working with a `genesis.json` and other chain config structs.
+mod genesis;
+pub use genesis::{ChainConfig, Genesis};
+
 /// Utilities for launching an anvil instance
 #[cfg(not(target_arch = "wasm32"))]
 mod anvil;
@@ -23,6 +27,7 @@ mod hash;
 pub use hash::{hash_message, id, keccak256, serialize};
 
 mod units;
+use serde::{Deserialize, Deserializer};
 pub use units::Units;
 
 /// Re-export RLP
@@ -32,12 +37,12 @@ pub use rlp;
 pub use hex;
 
 use crate::types::{Address, Bytes, ParseI256Error, I256, U256};
-use elliptic_curve::sec1::ToEncodedPoint;
 use ethabi::ethereum_types::FromDecStrErr;
-use k256::{ecdsa::SigningKey, PublicKey as K256PublicKey};
+use k256::ecdsa::SigningKey;
 use std::{
     convert::{TryFrom, TryInto},
     fmt,
+    str::FromStr,
 };
 use thiserror::Error;
 
@@ -377,7 +382,7 @@ pub fn get_create2_address_from_hash(
 
 /// Converts a K256 SigningKey to an Ethereum Address
 pub fn secret_key_to_address(secret_key: &SigningKey) -> Address {
-    let public_key = K256PublicKey::from(&secret_key.verifying_key());
+    let public_key = secret_key.verifying_key();
     let public_key = public_key.to_encoded_point(/* compress = */ false);
     let public_key = public_key.as_bytes();
     debug_assert_eq!(public_key[0], 0x04);
@@ -413,7 +418,7 @@ pub fn to_checksum(addr: &Address, chain_id: Option<u8>) -> String {
 pub fn format_bytes32_string(text: &str) -> Result<[u8; 32], ConversionError> {
     let str_bytes: &[u8] = text.as_bytes();
     if str_bytes.len() > 32 {
-        return Err(ConversionError::TextTooLong)
+        return Err(ConversionError::TextTooLong);
     }
 
     let mut bytes32: [u8; 32] = [0u8; 32];
@@ -447,14 +452,42 @@ pub fn eip1559_default_estimator(base_fee_per_gas: U256, rewards: Vec<Vec<U256>>
     (max_fee_per_gas, max_priority_fee_per_gas)
 }
 
+/// Deserializes the input into a U256, accepting both 0x-prefixed hex and decimal strings with
+/// arbitrary precision, defined by serde_json's [`Number`](serde_json::Number).
+pub fn from_int_or_hex<'de, D>(deserializer: D) -> Result<U256, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrHex {
+        Int(serde_json::Number),
+        Hex(String),
+    }
+
+    match IntOrHex::deserialize(deserializer)? {
+        IntOrHex::Hex(s) => U256::from_str(s.as_str()).map_err(serde::de::Error::custom),
+        IntOrHex::Int(n) => U256::from_dec_str(&n.to_string()).map_err(serde::de::Error::custom),
+    }
+}
+
+/// Deserializes the input into an `Option<U256>`, using [`from_int_or_hex`] to deserialize the
+/// inner value.
+pub fn from_int_or_hex_opt<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(from_int_or_hex(deserializer)?))
+}
+
 fn estimate_priority_fee(rewards: Vec<Vec<U256>>) -> U256 {
     let mut rewards: Vec<U256> =
         rewards.iter().map(|r| r[0]).filter(|r| *r > U256::zero()).collect();
     if rewards.is_empty() {
-        return U256::zero()
+        return U256::zero();
     }
     if rewards.len() == 1 {
-        return rewards[0]
+        return rewards[0];
     }
     // Sort the rewards as we will eventually take the median.
     rewards.sort();
@@ -481,8 +514,8 @@ fn estimate_priority_fee(rewards: Vec<Vec<U256>>) -> U256 {
 
     // If we encountered a big change in fees at a certain position, then consider only
     // the values >= it.
-    let values = if *max_change >= EIP1559_FEE_ESTIMATION_THRESHOLD_MAX_CHANGE.into() &&
-        (max_change_index >= (rewards.len() / 2))
+    let values = if *max_change >= EIP1559_FEE_ESTIMATION_THRESHOLD_MAX_CHANGE.into()
+        && (max_change_index >= (rewards.len() / 2))
     {
         rewards[max_change_index..].to_vec()
     } else {
